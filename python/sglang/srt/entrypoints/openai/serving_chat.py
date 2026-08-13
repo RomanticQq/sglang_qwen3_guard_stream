@@ -62,10 +62,32 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _is_qwen3_guard_model(self) -> bool:
+        hf_config = getattr(self.tokenizer_manager.model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None) or []
+        return "Qwen3ForGuardModel" in architectures
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+
+        if self._is_qwen3_guard_model():
+            if request.stream:
+                return (
+                    "Qwen3Guard only supports non-streaming OpenAI chat requests; "
+                    "set stream=false."
+                )
+            if request.n != 1:
+                return "Qwen3Guard only supports n=1."
+            if request.logprobs:
+                return "Qwen3Guard does not support OpenAI token logprobs."
+            if request.tools:
+                return "Qwen3Guard does not support tool calls."
+
+            max_output_tokens = request.max_completion_tokens or request.max_tokens
+            if max_output_tokens not in (None, 1):
+                return "Qwen3Guard requires max_tokens=1."
 
         if (
             isinstance(request.tool_choice, str)
@@ -260,11 +282,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 assistant_prefix = openai_compatible_messages[-1]["content"]
                 openai_compatible_messages = openai_compatible_messages[:-1]
 
+        # Qwen3Guard classifies the last token of a completed message. Appending an
+        # empty assistant turn would move the classification point past the user
+        # message, so keep the prompt ending at <|im_end|> for Guard requests.
+        add_generation_prompt = not self._is_qwen3_guard_model()
+
         try:
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
                 tokenize=True,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
                 **(
@@ -283,7 +310,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
                 tokenize=True,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
                 **(
@@ -387,7 +414,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
+            "max_new_tokens": (
+                1
+                if self._is_qwen3_guard_model()
+                else request.max_tokens or request.max_completion_tokens
+            ),
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -704,6 +735,9 @@ class OpenAIServingChat(OpenAIServingBase):
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
+        if self._is_qwen3_guard_model():
+            return self._build_guard_chat_response(request, ret, created)
+
         choices = []
 
         for idx, ret_item in enumerate(ret):
@@ -785,6 +819,66 @@ class OpenAIServingChat(OpenAIServingBase):
             choices=choices,
             usage=usage,
             metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+        )
+
+    def _build_guard_chat_response(
+        self,
+        request: ChatCompletionRequest,
+        ret: List[Dict[str, Any]],
+        created: int,
+    ) -> ChatCompletionResponse:
+        """Wrap Qwen3Guard logits in an OpenAI-compatible assistant message."""
+        guard_keys = (
+            "risk_level_logits",
+            "category_logits",
+            "query_risk_level_logits",
+            "query_category_logits",
+        )
+        choices = []
+
+        for idx, ret_item in enumerate(ret):
+            meta_info = ret_item["meta_info"]
+            meta_info.setdefault("completion_tokens", 0)
+            finish_reason = meta_info.get("finish_reason")
+            payload = {key: ret_item[key] for key in guard_keys if key in ret_item}
+
+            choices.append(
+                ChatCompletionResponseChoice(
+                    index=idx,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                    logprobs=None,
+                    finish_reason=(
+                        finish_reason["type"] if finish_reason else "stop"
+                    ),
+                    matched_stop=(
+                        finish_reason.get("matched") if finish_reason else None
+                    ),
+                )
+            )
+
+        usage = UsageProcessor.calculate_response_usage(
+            ret,
+            n_choices=request.n,
+            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+        )
+
+        return ChatCompletionResponse(
+            id=ret[0]["meta_info"]["id"],
+            created=created,
+            model=request.model,
+            choices=choices,
+            usage=usage,
+            metadata={
+                "weight_version": ret[0]["meta_info"].get("weight_version"),
+                "output_type": "qwen3_guard_logits",
+            },
         )
 
     def _process_logprobs_tokens(

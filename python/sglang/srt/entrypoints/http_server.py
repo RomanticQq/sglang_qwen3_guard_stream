@@ -377,7 +377,11 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.is_image_gen:
         # Keep this branch for some internal use cases.
         raise NotImplementedError("Image generation is not supported yet.")
-    elif _global_state.tokenizer_manager.is_generation:
+    elif (
+        _global_state.tokenizer_manager.is_generation
+        or "Qwen3ForGuardModel"
+        in _global_state.tokenizer_manager.model_config.hf_config.architectures
+    ):
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
@@ -1345,8 +1349,16 @@ def _execute_server_warmup(
     model_info = res.json()
 
     # Send a warmup request
-    request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    is_stream_guard = (
+        "Qwen3ForGuardModel"
+        in _global_state.tokenizer_manager.model_config.hf_config.architectures
+    )
+    request_name = (
+        "/generate"
+        if model_info["is_generation"] or is_stream_guard
+        else "/encode"
+    )
+    max_new_tokens = 1 if is_stream_guard else (8 if model_info["is_generation"] else 1)
     json_data = {
         "sampling_params": {
             "temperature": 0,
